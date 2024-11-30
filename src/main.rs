@@ -206,6 +206,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Warning: Failed to wipe ELF header");
     }
 
+    // close the memfd
+    regs.rip = free_addr;
+    regs.rax = libc::SYS_close as u64;
+    regs.rdi = fd;
+
+    tracer.setregs(regs)?;
+    tracer.wait_execute(
+        regs.rip as usize,
+        &[
+            0x0f, 0x05, // syscall
+        ],
+    )?;
+
     tracer.restore()?;
     tracer.setregs(original_regs)?;
 
