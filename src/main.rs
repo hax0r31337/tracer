@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::{ffi::CString, io::Read};
 
 use nix::libc;
 use procfs::process::{MMPermissions, MMapPath};
@@ -6,6 +6,12 @@ use rand::Rng;
 
 pub mod proc;
 pub mod ptrace;
+
+/// the size of each chunk of library data to write into the target process
+/// to avoid directly opening the library file in the target process
+const CHUNK_SIZE: usize = 0x1000;
+/// use a fake memfd name to avoid detection from dl_iterate_phdr
+const MEMFD_NAME: &str = "pipewire-memfd";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -104,24 +110,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracer.interrupt_and_waitpid()?;
     let original_regs = tracer.getregs()?;
 
+    // create a memfd in the target process
+    let memfd_name = ptrace::align_data(
+        CString::new(MEMFD_NAME)
+            .unwrap()
+            .as_bytes_with_nul()
+            .to_vec(),
+    );
+    tracer.write(free_addr as usize, &memfd_name)?;
+
+    let mut regs = original_regs;
+    regs.rip = free_addr + memfd_name.len() as u64;
+    regs.rax = libc::SYS_memfd_create as u64;
+    regs.rdi = free_addr;
+    regs.rsi = 0;
+
+    tracer.setregs(regs)?;
+    tracer.wait_execute(
+        regs.rip as usize,
+        &[
+            0x0f, 0x05, // syscall
+        ],
+    )?;
+
+    // write the library to the memfd
+    let fd = tracer.getregs()?.rax;
+    {
+        let mut file = std::fs::File::open(library_path_str)?;
+        let mut buf = [0; CHUNK_SIZE];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+
+            tracer.write(free_addr as usize, &buf[..n])?;
+
+            regs.rip = free_addr + CHUNK_SIZE as u64;
+            regs.rax = libc::SYS_write as u64;
+            regs.rdi = fd;
+            regs.rsi = free_addr;
+            regs.rdx = n as u64;
+
+            tracer.setregs(regs)?;
+            tracer.wait_execute(
+                regs.rip as usize,
+                &[
+                    0x0f, 0x05, // syscall
+                ],
+            )?;
+        }
+    }
+
     // write library path first
     // but we have to pad it with null bytes to 8 bytes alignment
-    let library_path = {
-        let mut path = CString::new(library_path_str.to_string())?
+    let library_path = ptrace::align_data(
+        CString::new(format!("/proc/self/fd/{}", fd))?
             .as_bytes_with_nul()
-            .to_vec();
-        let len = path.len();
-        let rem = len % 8;
-        if rem != 0 {
-            path.extend_from_slice(&vec![0; 8 - rem]);
-        }
-
-        path
-    };
+            .to_vec(),
+    );
 
     tracer.write(free_addr as usize, &library_path)?;
 
-    let mut regs = original_regs;
     regs.rip = free_addr + library_path.len() as u64;
     regs.rax = module_offset + offset;
     regs.rdi = free_addr as u64; // filename
@@ -136,90 +186,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
     )?;
 
-    // remap the module with anonymous mmap to avoid detection
-    // back up the original module first
-    let (module_frags, min_addr, max_addr) = {
-        let mut v = Vec::new();
-        let mut min_addr = u64::MAX;
-        let mut max_addr = 0;
-
-        for map in process.maps()? {
-            if let MMapPath::Path(ref path) = map.pathname {
-                if path.to_string_lossy() == *library_path_str {
-                    let mut buffer = proc::dump_module(&process, &map)?;
-                    if map.offset == 0 {
-                        // wipe ELF header
-                        // this is to avoid detection by anti-cheat
-                        rng.fill(&mut buffer[..0x40]);
-                    }
-                    v.push((map.address.0, buffer));
-
-                    if map.address.0 < min_addr {
-                        min_addr = map.address.0;
-                    }
-
-                    if map.address.1 > max_addr {
-                        max_addr = map.address.1;
-                    }
-                }
+    // wipe elf header
+    // to avoid memory walking detection
+    let mut header_wiped = false;
+    let expected_mmap_name = format!("/memfd:{} (deleted)", MEMFD_NAME);
+    for map in process.maps()? {
+        if let MMapPath::Path(ref path) = map.pathname {
+            if path.to_string_lossy() == expected_mmap_name && map.offset == 0 {
+                let mut buffer = [0u8; 0x40];
+                rng.fill(&mut buffer);
+                tracer.write(map.address.0 as usize, &buffer)?;
+                header_wiped = true;
+                break;
             }
         }
+    }
 
-        if v.is_empty() {
-            // recover to original state
-            tracer.restore()?;
-            tracer.setregs(original_regs)?;
-            tracer.detach()?;
-
-            return Err("Module not found, injection failed".into());
-        }
-
-        (v, min_addr, max_addr)
-    };
-
-    println!("Remapping module: 0x{:x} - 0x{:x}", min_addr, max_addr);
-    regs.rip = free_addr;
-    regs.rax = libc::SYS_munmap as u64;
-    regs.rdi = min_addr;
-    regs.rsi = max_addr - min_addr;
-    regs.rdx = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-    regs.r10 = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as u64;
-    regs.r8 = -1i64 as u64;
-    regs.r9 = 0;
-
-    tracer.setregs(regs)?;
-    tracer.wait_execute(
-        regs.rip as usize,
-        &[
-            0x0f, 0x05, // syscall
-            0x48, 0xc7, 0xc0, 0x09, 0x00, 0x00, 0x00, // mov rax, 0x9 (mmap)
-            0x0f, 0x05, // syscall
-        ],
-    )?;
-
-    // rename the mmaped module to [anon:v8]
-    // to make it seems like a JIT region generated by the v8 engine
-    regs.rip = free_addr + 8;
-    regs.rax = libc::SYS_prctl as u64;
-    regs.rdi = libc::PR_SET_VMA as u64;
-    regs.rsi = libc::PR_SET_VMA_ANON_NAME as u64;
-    regs.rdx = min_addr;
-    regs.r10 = max_addr - min_addr;
-    regs.r8 = free_addr;
-
-    tracer.write(free_addr as usize, &[b'v', b'8', 0, 0, 0, 0, 0, 0])?;
-
-    tracer.setregs(regs)?;
-    tracer.wait_execute(
-        regs.rip as usize,
-        &[
-            0x0f, 0x05, // syscall
-        ],
-    )?;
-
-    // write the module back
-    for (addr, data) in module_frags {
-        proc::write_memory(&process, addr as usize, &data)?;
+    if !header_wiped {
+        println!("Warning: Failed to wipe ELF header");
     }
 
     tracer.restore()?;

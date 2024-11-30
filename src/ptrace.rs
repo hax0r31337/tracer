@@ -126,3 +126,12 @@ impl Tracer {
         Ok(())
     }
 }
+
+pub fn align_data(mut data: Vec<u8>) -> Vec<u8> {
+    let rem = data.len() % 8;
+    if rem != 0 {
+        data.extend_from_slice(&vec![0; 8 - rem]);
+    }
+
+    data
+}
