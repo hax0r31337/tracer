@@ -17,6 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     if args.len() < 3 {
         eprintln!("Usage: {} <process_name/pid:pid> <library_path>", args[0]);
+        eprintln!("Options:");
+        eprintln!("\t-m: Mask the library with a random library in /usr/lib");
+        eprintln!("\t-c: Divide masking library into chunks and mprotect each chunk");
         std::process::exit(1);
     }
 
@@ -27,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut library_file = std::fs::File::open(&args[2])?;
     let do_masking = args.contains(&String::from("-m"));
+    let masking_mode = args.contains(&String::from("-c"));
     let mut rng = rand::thread_rng();
 
     // we want to avoid attaching to the main thread as much as possible
@@ -270,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let MMapPath::Path(ref path) = map.pathname {
                     if path.to_string_lossy() == expected_mmap_name {
                         let buffer = proc::dump_module(&process, map)?;
-                        v.push((map.address.0, buffer));
+                        v.push((map.address.0, map.perms, buffer));
 
                         if map.address.0 < min_addr {
                             min_addr = map.address.0;
@@ -370,7 +374,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         regs.rax = libc::SYS_munmap as u64;
         regs.rdi = min_addr - masking_offset as u64;
         regs.rsi = *masking_size as u64;
-        regs.rdx = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+        regs.rdx = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        if !masking_mode {
+            regs.rdx |= libc::PROT_EXEC as u64;
+        }
+
         regs.r10 = (libc::MAP_PRIVATE | libc::MAP_FIXED) as u64;
         regs.r8 = masking_fd;
         regs.r9 = 0;
@@ -393,8 +401,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         // write the module back
-        for (addr, data) in module_frags {
+        for (addr, perms, data) in module_frags {
             proc::write_memory(&process, addr as usize, &data)?;
+
+            if masking_mode {
+                regs.rip = free_addr;
+                regs.rax = libc::SYS_mprotect as u64;
+                regs.rdi = addr;
+                regs.rsi = data.len() as u64;
+                regs.rdx = 0;
+
+                if perms & MMPermissions::READ == MMPermissions::READ {
+                    regs.rdx |= libc::PROT_READ as u64;
+                }
+                if perms & MMPermissions::WRITE == MMPermissions::WRITE {
+                    regs.rdx |= libc::PROT_WRITE as u64;
+                }
+                if perms & MMPermissions::EXECUTE == MMPermissions::EXECUTE {
+                    regs.rdx |= libc::PROT_EXEC as u64;
+                }
+
+                tracer.setregs(regs)?;
+                tracer.wait_execute(
+                    regs.rip as usize,
+                    &[
+                        0x0f, 0x05, // syscall
+                    ],
+                )?;
+            }
         }
 
         // close the masking fd
